@@ -129,6 +129,10 @@ def build_arg_parser():
     p.add_argument("--insecure", action="store_true", help="Disable SSL certificate verification")
     p.add_argument("--verbose", action="store_true",
                     help="Print full detailed log (every file, every chunk, every endpoint). Default: compact animated status line + key events only")
+    p.add_argument("--resume", action="store_true",
+                    help="Load existing state from --output dir (endpoints/js_files/chunks already found) before crawling, so an interrupted run can continue instead of restarting")
+    p.add_argument("--json", action="store_true",
+                    help="Also write a results.json summary (all sets + counts) to the output dir")
     return p
 
 
@@ -371,18 +375,44 @@ WEBPACK_ID_HASH_MAP_RE = re.compile(r'\{(\s*"?[0-9]+"?\s*:\s*"[0-9a-fA-F]{6,}"\s
 WEBPACK_ID_HASH_ENTRY_RE = re.compile(r'"?([0-9]+)"?\s*:\s*"([0-9a-fA-F]{6,})"')
 
 
-def extract_id_hash_chunks(text, base_url):
+def extract_id_hash_chunks(text, base_url, session=None, args=None, state=None):
     """Find webpack chunk-id -> hash map objects and reconstruct plausible
     chunk filenames from them, since these are built at runtime via string
-    concatenation rather than appearing as literal filenames."""
+    concatenation rather than appearing as literal filenames.
+
+    Rather than blindly generating both ".async.js" and ".chunk.js" guesses
+    for every id (doubling requests), probe the first entry once with a
+    quick HEAD request to learn which suffix this build actually uses, cache
+    it in state, and reuse it for the rest of the map."""
     found = set()
+    known_suffix = state.get("chunk_suffix") if state is not None else None
+
     for map_match in WEBPACK_ID_HASH_MAP_RE.finditer(text):
         block = map_match.group(0)
         entries = WEBPACK_ID_HASH_ENTRY_RE.findall(block)
         if len(entries) < 2:
             continue
-        for chunk_id, chunk_hash in entries:
+
+        if known_suffix is None and session is not None and args is not None and state is not None:
+            probe_id, probe_hash = entries[0]
             for suffix in (".async.js", ".chunk.js"):
+                candidate = "%s.%s%s" % (probe_id, probe_hash, suffix)
+                probe_url = normalize_url(candidate, base_url)
+                if not probe_url:
+                    continue
+                try:
+                    resp = session.head(probe_url, timeout=(args.timeout, args.timeout), allow_redirects=True)
+                    if resp.status_code != 405 and 200 <= resp.status_code < 400:
+                        known_suffix = suffix
+                        state["chunk_suffix"] = suffix
+                        REPORTER.detail("     Detected chunk suffix: %s" % suffix)
+                        break
+                except requests.exceptions.RequestException:
+                    continue
+
+        suffixes = (known_suffix,) if known_suffix else (".async.js", ".chunk.js")
+        for chunk_id, chunk_hash in entries:
+            for suffix in suffixes:
                 candidate = "%s.%s%s" % (chunk_id, chunk_hash, suffix)
                 url = normalize_url(candidate, base_url)
                 if url:
@@ -405,7 +435,7 @@ def looks_like_valid_chunk_name(name):
     return bool(CHUNK_NAME_VALID.search(name))
 
 
-def extract_chunks_from_text(text, base_url):
+def extract_chunks_from_text(text, base_url, session=None, args=None, state=None):
     found = set()
     for pattern in CHUNK_SIGNAL_PATTERNS:
         for m in pattern.finditer(text):
@@ -424,7 +454,7 @@ def extract_chunks_from_text(text, base_url):
             if not url:
                 continue
             found.add(url)
-    found |= extract_id_hash_chunks(text, base_url)
+    found |= extract_id_hash_chunks(text, base_url, session=session, args=args, state=state)
     return found
 
 
@@ -597,6 +627,7 @@ def new_state(output_dir):
         "js_chunks": set(),
         "spa_routes": set(),
         "dead_chunks": set(),
+        "chunk_suffix": None,
         "output_dir": output_dir,
         "endpoints_path": os.path.join(output_dir, "endpoints.txt"),
         "pages_path": os.path.join(output_dir, "pages_crawled.txt"),
@@ -605,6 +636,43 @@ def new_state(output_dir):
         "jschunks_path": os.path.join(output_dir, "js_chunks.txt"),
         "routes_path": os.path.join(output_dir, "spa_routes.txt"),
     }
+
+
+RESUME_KEYS = (
+    ("pages_crawled", "pages_path"),
+    ("js_files", "jsfiles_path"),
+    ("js_endpoints", "jsendpoints_path"),
+    ("js_chunks", "jschunks_path"),
+    ("spa_routes", "routes_path"),
+    ("endpoints", "endpoints_path"),
+)
+
+
+def load_resume_state(state):
+    """Populate state's in-memory sets from an existing output dir so a
+    previous run's progress is not rediscovered/re-downloaded from scratch."""
+    loaded = 0
+    for set_key, path_key in RESUME_KEYS:
+        path = state[path_key]
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    state[set_key].add(line)
+                    loaded += 1
+    js_dir = os.path.join(state["output_dir"], "js_files")
+    downloaded_urls = set()
+    if os.path.isdir(js_dir):
+        # Any URL already recorded in js_files.txt whose file exists on disk
+        # is treated as already downloaded, so it won't be re-fetched.
+        existing_names = set(os.listdir(js_dir))
+        for url in state["js_files"]:
+            name = os.path.basename(urllib.parse.urlsplit(url).path)
+            if name in existing_names:
+                downloaded_urls.add(url)
+    return loaded, downloaded_urls
 
 
 def add_new(state, key, path, item):
@@ -619,6 +687,30 @@ def flush_final(state):
     write_sorted_set(state["endpoints_path"], state["endpoints"])
     write_sorted_set(state["jsendpoints_path"], state["js_endpoints"])
     write_sorted_set(state["jschunks_path"], state["js_chunks"])
+
+
+def write_json_results(state, args):
+    import json
+    payload = {
+        "url": args.url,
+        "pages_crawled": sorted(state["pages_crawled"]),
+        "endpoints": sorted(state["endpoints"]),
+        "js_files": sorted(state["js_files"]),
+        "js_endpoints": sorted(state["js_endpoints"]),
+        "js_chunks": sorted(state["js_chunks"]),
+        "spa_routes": sorted(state["spa_routes"]),
+        "counts": {
+            "pages_crawled": len(state["pages_crawled"]),
+            "endpoints": len(state["endpoints"]),
+            "js_files": len(state["js_files"]),
+            "js_chunks": len(state["js_chunks"]),
+            "js_endpoints": len(state["js_endpoints"]),
+        },
+    }
+    path = os.path.join(state["output_dir"], "results.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return path
 
 
 # ---- Page Crawl (recursive) ----
@@ -660,7 +752,7 @@ def extract_links_and_scripts(html, base_url):
     return scripts, links, inline_js
 
 
-def process_js_content(text, source_url, state, args):
+def process_js_content(text, source_url, state, args, session=None):
     skip_endpoints = args.skip_framework and is_framework_bundle(source_url)
 
     endpoints = set() if skip_endpoints else extract_endpoints_from_text(text, source_url)
@@ -681,7 +773,7 @@ def process_js_content(text, source_url, state, args):
         REPORTER.detail("     Found %d endpoints (%d new) in %.1fs" % (len(endpoints), new_endpoints, elapsed))
     REPORTER.counters["endpoints"] = len(state["endpoints"])
 
-    chunks = extract_chunks_from_text(text, source_url)
+    chunks = extract_chunks_from_text(text, source_url, session=session, args=args, state=state)
     new_chunks = 0
     for c in chunks:
         if c in state["dead_chunks"]:
@@ -725,7 +817,7 @@ def handle_js_file(session, url, referer, args, state, downloaded_urls):
         REPORTER.log("     Could not read downloaded file: %s" % e, always=True)
         return set()
 
-    chunks = process_js_content(text, url, state, args)
+    chunks = process_js_content(text, url, state, args, session=session)
 
     for chunk_url in chunks:
         route = derive_spa_route(chunk_url, args.url)
@@ -770,7 +862,7 @@ def crawl_page(session, url, depth, args, state, base_domain, visited, downloade
     scripts, links, inline_js = extract_links_and_scripts(html, final_url)
 
     for block in inline_js:
-        process_js_content(block, final_url, state, args)
+        process_js_content(block, final_url, state, args, session=session)
 
     for link in links:
         add_new(state, "endpoints", state["endpoints_path"], link)
@@ -886,6 +978,11 @@ def main():
     visited = set()
     downloaded_urls = set()
 
+    if args.resume:
+        loaded, downloaded_urls = load_resume_state(state)
+        visited = set(state["pages_crawled"])
+        print("Resumed: %d prior lines loaded, %d JS files already on disk." % (loaded, len(downloaded_urls)))
+
     try:
         crawl_page(session, args.url, 0, args, state, base_domain, visited, downloaded_urls)
     except KeyboardInterrupt:
@@ -895,6 +992,9 @@ def main():
         REPORTER.clear_status()
         flush_final(state)
         print_summary(state)
+        if args.json:
+            json_path = write_json_results(state, args)
+            print("JSON results: %s" % json_path)
 
 
 if __name__ == "__main__":
