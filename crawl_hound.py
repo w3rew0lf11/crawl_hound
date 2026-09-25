@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import urllib.parse
+from collections import deque
 
 try:
     import requests
@@ -53,7 +54,6 @@ class Reporter:
         return c
 
     def status(self, msg):
-        """Overwrite a single status line. No-op in verbose mode."""
         if self.verbose or not self._is_tty:
             return
         line = "  %s %s" % (self._spin(), msg)
@@ -71,15 +71,11 @@ class Reporter:
             self._last_len = 0
 
     def log(self, msg, always=False):
-        """Durable output line. In compact mode only 'always' lines (page
-        starts, warnings, interesting hits, summaries) print; routine
-        per-file/per-chunk detail is swallowed and reflected in status()."""
         if self.verbose or always:
             self.clear_status()
             print(msg)
 
     def detail(self, msg):
-        """Verbose-only line (per-file, per-chunk mechanics)."""
         if self.verbose:
             self.clear_status()
             print(msg)
@@ -107,32 +103,47 @@ def build_arg_parser():
     p.add_argument("--url", required=True, help="Start URL to crawl (required)")
     p.add_argument("--output", default="out", help="Output directory (default: out)")
     p.add_argument("--depth", type=int, default=None, help="Max crawl depth (default: infinite)")
+
+    # Domain scoping
     p.add_argument("--all-domains", action="store_true",
-                    help="Do NOT restrict crawl to the start URL's domain+subdomains (default: restricted)")
+                    help="Do NOT restrict crawl to the start URL's domain (default: restricted to parent domain + subdomains)")
+    p.add_argument("--same-subdomain", action="store_true",
+                    help="Restrict crawl to the EXACT host of --url (e.g. beta.repo.example.com only, not www.example.com). Overrides parent-domain matching.")
+    p.add_argument("--strip-query", action="store_true",
+                    help="Strip query strings from URLs before deduplication. Prevents crawl blowup on sites that generate unique URLs per tracking param. Default: off")
+
+    # Networking
     p.add_argument("--timeout", type=float, default=30, help="Connect timeout in seconds (default: 30)")
     p.add_argument("--read-timeout", type=float, default=120, help="Read timeout between chunks in seconds (default: 120)")
-    p.add_argument("--max-js-size", type=float, default=50, help="Max JS file size in MB (default: 50)")
-    p.add_argument("--max-chunks", type=int, default=500, help="Max recursive chunk downloads (default: 500)")
     p.add_argument("--retries", type=int, default=3, help="Download attempts per file (default: 3)")
+
+    # JS handling
+    p.add_argument("--max-js-size", type=float, default=50, help="Max JS file size in MB (default: 50)")
+    p.add_argument("--max-chunks", type=int, default=0,
+                   help="Max recursive chunk downloads (0 = unlimited, default: 0)")
     p.add_argument("--skip-sourcemaps", action="store_true", help="Skip .map / .js.map files")
     p.add_argument("--skip-framework", dest="skip_framework", action="store_true", default=True,
-                    help="Don't report endpoints/API calls found inside known framework/vendor bundles (vendors*, runtime*, umi*, react*, polyfill*, moment*, antd*, etc.) -- they are still downloaded and scanned for chunk discovery, since chunk maps often live inside them. Default: on")
+                    help="Don't report endpoints found inside framework/vendor bundles (vendors*, runtime*, umi*, react*, etc.). Bundles are still downloaded and scanned for chunk discovery. Default: on")
     p.add_argument("--include-framework", dest="skip_framework", action="store_false",
                     help="Include framework/vendor bundle contents in extracted endpoints (disables --skip-framework)")
+
+    # Auth
     p.add_argument("--cookie", default=None, help="Inline cookie string, e.g. 'session=abc; csrf=xyz'")
-    p.add_argument("--cookie-file", default=None, help="Cookie file (Netscape format or plain name=value; lines)")
+    p.add_argument("--cookie-file", default=None, help="Cookie file (Netscape format or plain name=value lines)")
     p.add_argument("--token", default=None, help="Bearer/raw auth token")
     p.add_argument("--auth-type", default="Bearer", choices=["Bearer", "Basic", "None"],
                     help="Auth scheme for --token (default: Bearer)")
     p.add_argument("--header", action="append", default=[], help="Custom header 'Name: Value' (repeatable)")
     p.add_argument("--user-agent", default=None, help="Override User-Agent header")
     p.add_argument("--insecure", action="store_true", help="Disable SSL certificate verification")
+
+    # Output / behavior
     p.add_argument("--verbose", action="store_true",
-                    help="Print full detailed log (every file, every chunk, every endpoint). Default: compact animated status line + key events only")
+                    help="Print full detailed log (every file, every chunk, every endpoint). Default: compact status line")
     p.add_argument("--resume", action="store_true",
-                    help="Load existing state from --output dir (endpoints/js_files/chunks already found) before crawling, so an interrupted run can continue instead of restarting")
+                    help="Load existing state from --output dir before crawling, so an interrupted run can continue")
     p.add_argument("--json", action="store_true",
-                    help="Also write a results.json summary (all sets + counts) to the output dir")
+                    help="Also write a results.json summary to the output dir")
     return p
 
 
@@ -176,7 +187,6 @@ def parse_cookie_file(path):
             if not line or line.startswith("#"):
                 continue
             if "\t" in line:
-                # Netscape cookie file format
                 fields = line.split("\t")
                 if len(fields) >= 7:
                     name, val = fields[5], fields[6]
@@ -230,6 +240,9 @@ def build_session(args, start_url):
 
 # ---- Helper Functions ----
 
+_STRIP_QUERY = False  # module-level, set in main() from args
+
+
 def ensure_dirs(output_dir):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "js_files"), exist_ok=True)
@@ -245,11 +258,25 @@ def registrable_domain(host):
 
 
 def same_domain(url, base_domain):
-    """True if url's host equals base_domain or is a subdomain of it
-    (matched on registrable domain, e.g. api.example.com vs example.com)."""
+    """True if url's host equals base_domain or is a subdomain of it,
+    matched on registrable domain (e.g. api.example.com vs example.com)."""
     host = domain_of(url)
     return host == base_domain or host.endswith("." + base_domain) or \
         registrable_domain(host) == registrable_domain(base_domain)
+
+
+def same_host(url, base_host):
+    """True only if url's host exactly equals base_host (case-insensitive)."""
+    return domain_of(url) == base_host.lower()
+
+
+def host_allowed(url, args, base_domain):
+    """Unified domain check that honors --all-domains and --same-subdomain."""
+    if args.all_domains:
+        return True
+    if args.same_subdomain:
+        return same_host(url, base_domain)
+    return same_domain(url, base_domain)
 
 
 def normalize_url(candidate, base_url):
@@ -263,6 +290,8 @@ def normalize_url(candidate, base_url):
     except Exception:
         return None
     joined, _frag = urllib.parse.urldefrag(joined)
+    if _STRIP_QUERY:
+        joined = urllib.parse.urlsplit(joined)._replace(query="").geturl()
     return joined
 
 
@@ -367,23 +396,11 @@ CHUNK_SIGNAL_PATTERNS = [
     re.compile(r'["\']([pP]__[a-zA-Z0-9_]+)["\']'),
 ]
 
-# Webpack chunk id -> hash maps, e.g. {3:"39731c9d",8:"c6b64dcc"} or
-# {"3":"39731c9d","8":"c6b64dcc"}. Chunk filenames are built at runtime as
-# "<id>.<hash>.async.js" (or "<id>.<hash>.chunk.js"), so no literal string
-# exists in the bundle for these -- the map itself must be parsed.
 WEBPACK_ID_HASH_MAP_RE = re.compile(r'\{(\s*"?[0-9]+"?\s*:\s*"[0-9a-fA-F]{6,}"\s*,?\s*)+\}')
 WEBPACK_ID_HASH_ENTRY_RE = re.compile(r'"?([0-9]+)"?\s*:\s*"([0-9a-fA-F]{6,})"')
 
 
 def extract_id_hash_chunks(text, base_url, session=None, args=None, state=None):
-    """Find webpack chunk-id -> hash map objects and reconstruct plausible
-    chunk filenames from them, since these are built at runtime via string
-    concatenation rather than appearing as literal filenames.
-
-    Rather than blindly generating both ".async.js" and ".chunk.js" guesses
-    for every id (doubling requests), probe the first entry once with a
-    quick HEAD request to learn which suffix this build actually uses, cache
-    it in state, and reuse it for the rest of the map."""
     found = set()
     known_suffix = state.get("chunk_suffix") if state is not None else None
 
@@ -419,6 +436,7 @@ def extract_id_hash_chunks(text, base_url, session=None, args=None, state=None):
                     found.add(url)
     return found
 
+
 CHUNK_NAME_VALID = re.compile(
     r'('
     r'\.async\.js$'
@@ -442,10 +460,7 @@ def extract_chunks_from_text(text, base_url, session=None, args=None, state=None
             candidate = m.group(1)
             if not candidate:
                 continue
-            if candidate.lower().startswith(("p__", "P__".lower())) is False and candidate.startswith(("p__", "P__")):
-                pass
             if re.match(r'^[pP]__[a-zA-Z0-9_]+$', candidate):
-                # Umi chunkName expansion -> filename
                 candidate = candidate + ".async.js"
             name = os.path.basename(candidate)
             if not looks_like_valid_chunk_name(name):
@@ -649,8 +664,6 @@ RESUME_KEYS = (
 
 
 def load_resume_state(state):
-    """Populate state's in-memory sets from an existing output dir so a
-    previous run's progress is not rediscovered/re-downloaded from scratch."""
     loaded = 0
     for set_key, path_key in RESUME_KEYS:
         path = state[path_key]
@@ -665,8 +678,6 @@ def load_resume_state(state):
     js_dir = os.path.join(state["output_dir"], "js_files")
     downloaded_urls = set()
     if os.path.isdir(js_dir):
-        # Any URL already recorded in js_files.txt whose file exists on disk
-        # is treated as already downloaded, so it won't be re-fetched.
         existing_names = set(os.listdir(js_dir))
         for url in state["js_files"]:
             name = os.path.basename(urllib.parse.urlsplit(url).path)
@@ -713,7 +724,7 @@ def write_json_results(state, args):
     return path
 
 
-# ---- Page Crawl (recursive) ----
+# ---- HTML Parsing ----
 
 def extract_links_and_scripts(html, base_url):
     scripts = set()
@@ -793,7 +804,7 @@ def handle_js_file(session, url, referer, args, state, downloaded_urls):
         return set()
     if args.skip_sourcemaps and (url.endswith(".map") or url.endswith(".js.map")):
         return set()
-    if len(downloaded_urls) >= args.max_chunks:
+    if args.max_chunks and len(downloaded_urls) >= args.max_chunks:
         return set()
 
     downloaded_urls.add(url)
@@ -821,68 +832,88 @@ def handle_js_file(session, url, referer, args, state, downloaded_urls):
 
     for chunk_url in chunks:
         route = derive_spa_route(chunk_url, args.url)
-        if route and add_new(state, "spa_routes", state["routes_path"], route):
-            pass
+        if route:
+            add_new(state, "spa_routes", state["routes_path"], route)
 
     return chunks
 
 
-def crawl_page(session, url, depth, args, state, base_domain, visited, downloaded_urls):
-    if url in visited:
-        return
-    if args.depth is not None and depth > args.depth:
-        return
-    if not args.all_domains and not same_domain(url, base_domain):
-        return
+# ---- Page Crawl (iterative BFS) ----
 
-    visited.add(url)
-    label = "[%d/%s]" % (depth, str(args.depth) if args.depth is not None else "inf")
-    REPORTER.log("\nCrawling %s: %s" % (label, url), always=True)
-    REPORTER.counters["pages"] = len(state["pages_crawled"]) + 1
+def crawl_page(session, start_url, start_depth, args, state, base_domain, visited, downloaded_urls):
+    """Iterative breadth-first crawl. Uses an explicit queue instead of
+    recursion so deep link structures cannot overflow Python's stack.
 
-    try:
-        resp = session.get(url, timeout=(args.timeout, args.read_timeout), allow_redirects=True)
-    except requests.exceptions.RequestException as e:
-        REPORTER.log("  Failed to fetch: %s" % e, always=True)
-        return
+    Domain scope is controlled by three flags:
+      --all-domains       : no restriction
+      --same-subdomain    : exact host only
+      (default)           : parent registrable domain + its subdomains
+    """
+    queue = deque()
+    queue.append((start_url, start_depth))
 
-    final_url = resp.url
-    if "login" in final_url.lower() or "signin" in final_url.lower():
-        if "login" not in url.lower() and "signin" not in url.lower():
-            REPORTER.log("  WARNING: redirected to login/signin page -- auth may NOT be active.", always=True)
+    while queue:
+        url, depth = queue.popleft()
 
-    add_new(state, "pages_crawled", state["pages_path"], url)
-    add_new(state, "endpoints", state["endpoints_path"], url)
+        if url in visited:
+            continue
+        if args.depth is not None and depth > args.depth:
+            continue
+        if not host_allowed(url, args, base_domain):
+            continue
 
-    content_type = resp.headers.get("Content-Type", "")
-    if "text/html" not in content_type and not resp.text.strip().startswith("<"):
-        return
+        visited.add(url)
+        label = "[%d/%s]" % (depth, str(args.depth) if args.depth is not None else "inf")
+        REPORTER.log("\nCrawling %s: %s" % (label, url), always=True)
+        REPORTER.counters["pages"] = len(state["pages_crawled"]) + 1
 
-    html = resp.text
-    scripts, links, inline_js = extract_links_and_scripts(html, final_url)
+        try:
+            resp = session.get(url, timeout=(args.timeout, args.read_timeout),
+                               allow_redirects=True)
+        except requests.exceptions.RequestException as e:
+            REPORTER.log("  Failed to fetch: %s" % e, always=True)
+            continue
 
-    for block in inline_js:
-        process_js_content(block, final_url, state, args, session=session)
+        final_url = resp.url
+        if "login" in final_url.lower() or "signin" in final_url.lower():
+            if "login" not in url.lower() and "signin" not in url.lower():
+                REPORTER.log("  WARNING: redirected to login/signin page -- auth may NOT be active.", always=True)
 
-    for link in links:
-        add_new(state, "endpoints", state["endpoints_path"], link)
+        add_new(state, "pages_crawled", state["pages_path"], url)
+        add_new(state, "endpoints", state["endpoints_path"], url)
 
-    all_chunks = set()
-    for script_url in scripts:
-        add_new(state, "js_files", state["jsfiles_path"], script_url)
-        add_new(state, "endpoints", state["endpoints_path"], script_url)
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" not in content_type and not resp.text.strip().startswith("<"):
+            continue
 
-    for script_url in sorted(scripts):
-        found = handle_js_file(session, script_url, final_url, args, state, downloaded_urls)
-        all_chunks |= found
+        html = resp.text
+        scripts, links, inline_js = extract_links_and_scripts(html, final_url)
 
-    process_chunk_queue(session, all_chunks, final_url, args, state, downloaded_urls)
+        for block in inline_js:
+            process_js_content(block, final_url, state, args, session=session)
 
-    if args.depth is None or depth < args.depth:
-        for link in sorted(links):
-            if not args.all_domains and not same_domain(link, base_domain):
-                continue
-            crawl_page(session, link, depth + 1, args, state, base_domain, visited, downloaded_urls)
+        for link in links:
+            add_new(state, "endpoints", state["endpoints_path"], link)
+
+        all_chunks = set()
+        for script_url in scripts:
+            add_new(state, "js_files", state["jsfiles_path"], script_url)
+            add_new(state, "endpoints", state["endpoints_path"], script_url)
+
+        for script_url in sorted(scripts):
+            found = handle_js_file(session, script_url, final_url, args,
+                                   state, downloaded_urls)
+            all_chunks |= found
+
+        process_chunk_queue(session, all_chunks, final_url, args, state, downloaded_urls)
+
+        # Enqueue children (BFS) instead of recursing
+        if args.depth is None or depth < args.depth:
+            for link in sorted(links):
+                if not host_allowed(link, args, base_domain):
+                    continue
+                if link not in visited:
+                    queue.append((link, depth + 1))
 
 
 # ---- Chunk Queue Processor ----
@@ -891,7 +922,7 @@ def process_chunk_queue(session, initial_chunks, referer, args, state, downloade
     queue = set(initial_chunks)
     seen_in_queue = set(queue)
 
-    while queue and len(downloaded_urls) < args.max_chunks:
+    while queue and (not args.max_chunks or len(downloaded_urls) < args.max_chunks):
         batch = list(queue)[:64]
         for u in batch:
             queue.discard(u)
@@ -903,7 +934,7 @@ def process_chunk_queue(session, initial_chunks, referer, args, state, downloade
         valid, _dead = preflight_chunks(session, candidates, args, state)
 
         for chunk_url in valid:
-            if len(downloaded_urls) >= args.max_chunks:
+            if args.max_chunks and len(downloaded_urls) >= args.max_chunks:
                 REPORTER.log("  Max chunk limit (%d) reached, stopping chunk discovery." % args.max_chunks, always=True)
                 break
             REPORTER.detail("  CHUNK: %s" % chunk_url)
@@ -946,9 +977,12 @@ def print_summary(state):
 
 
 def main():
+    global _STRIP_QUERY
+
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    _STRIP_QUERY = bool(args.strip_query)
     REPORTER.verbose = args.verbose
 
     ensure_dirs(args.output)
@@ -959,15 +993,24 @@ def main():
 
     session, cookies, auth_header_set = build_session(args, args.url)
 
-    print("Crawling Hound  |  %s  |  domain: %s  |  framework JS: %s  |  ssl: %s" % (
+    if args.all_domains:
+        domain_scope = "unrestricted"
+    elif args.same_subdomain:
+        domain_scope = "same-subdomain"
+    else:
+        domain_scope = "same-domain"
+
+    print("Crawling Hound  |  %s  |  domain: %s  |  framework JS: %s  |  ssl: %s  |  strip-query: %s" % (
         args.url,
-        "restricted" if not args.all_domains else "unrestricted",
+        domain_scope,
         "skipped" if args.skip_framework else "included",
         "off" if args.insecure else "on",
+        "on" if args.strip_query else "off",
     ))
-    print("Output: %s/   Cookies: %d %s   Auth header: %s" % (
+    print("Output: %s/   Cookies: %d %s   Auth header: %s   Max chunks: %s" % (
         args.output, len(cookies), list(cookies.keys()) if cookies else "",
         "yes" if auth_header_set else "no",
+        str(args.max_chunks) if args.max_chunks else "unlimited",
     ))
     if not HAVE_BS4:
         print("Note: beautifulsoup4 not installed, falling back to regex HTML parsing.")
