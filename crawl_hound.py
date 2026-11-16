@@ -3,18 +3,23 @@
 crawl_hound.py - SPA-aware web crawler and JS endpoint extractor.
 
 Crawls a target site (including modern JS SPAs built with Umi, React,
-Angular, Vue, Webpack), recursively discovers dynamically-loaded JS
-chunks, and extracts API endpoints from downloaded bundles.
+Angular, Vue, Webpack, Vite, Rolldown), recursively discovers
+dynamically-loaded JS chunks, extracts API endpoints from downloaded
+bundles, and safely handles compressed (gzip/deflate/brotli/zstd) JS
+regardless of what the server or urllib3 version does.
 """
 
 import argparse
 import concurrent.futures
+import gzip
 import hashlib
 import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
+import zlib
 from collections import deque
 
 try:
@@ -32,11 +37,34 @@ except ImportError:
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    URLLIB3_VERSION = urllib3.__version__
 except Exception:
-    pass
+    URLLIB3_VERSION = "unknown"
+
+# Optional decompression backends
+try:
+    import brotli as _brotli_mod
+    HAVE_BROTLI = True
+    _BROTLI_MODE = "brotli"
+except ImportError:
+    try:
+        import brotlicffi as _brotli_mod
+        HAVE_BROTLI = True
+        _BROTLI_MODE = "brotlicffi"
+    except ImportError:
+        HAVE_BROTLI = False
+        _BROTLI_MODE = ""
+
+try:
+    import zstandard as _zstd_mod
+    HAVE_ZSTD = True
+except ImportError:
+    HAVE_ZSTD = False
 
 
-# ---- Reporter (managed, minimal, animated console output) ----
+# =============================================================================
+# Reporter
+# =============================================================================
 
 class Reporter:
     SPINNER = "|/-\\"
@@ -46,6 +74,7 @@ class Reporter:
         self._spin_i = 0
         self._last_len = 0
         self._is_tty = sys.stdout.isatty()
+        self._lock = threading.Lock()
         self.counters = {"pages": 0, "js_files": 0, "chunks": 0, "endpoints": 0, "interesting": 0}
 
     def _spin(self):
@@ -56,19 +85,21 @@ class Reporter:
     def status(self, msg):
         if self.verbose or not self._is_tty:
             return
-        line = "  %s %s" % (self._spin(), msg)
-        pad = max(self._last_len - len(line), 0)
-        sys.stdout.write("\r" + line + (" " * pad))
-        sys.stdout.flush()
-        self._last_len = len(line)
+        with self._lock:
+            line = "  %s %s" % (self._spin(), msg)
+            pad = max(self._last_len - len(line), 0)
+            sys.stdout.write("\r" + line + (" " * pad))
+            sys.stdout.flush()
+            self._last_len = len(line)
 
     def clear_status(self):
         if self.verbose or not self._is_tty:
             return
-        if self._last_len:
-            sys.stdout.write("\r" + (" " * self._last_len) + "\r")
-            sys.stdout.flush()
-            self._last_len = 0
+        with self._lock:
+            if self._last_len:
+                sys.stdout.write("\r" + (" " * self._last_len) + "\r")
+                sys.stdout.flush()
+                self._last_len = 0
 
     def log(self, msg, always=False):
         if self.verbose or always:
@@ -93,7 +124,9 @@ class Reporter:
 REPORTER = Reporter()
 
 
-# ---- CLI Parsing ----
+# =============================================================================
+# CLI
+# =============================================================================
 
 def build_arg_parser():
     p = argparse.ArgumentParser(
@@ -106,48 +139,70 @@ def build_arg_parser():
 
     # Domain scoping
     p.add_argument("--all-domains", action="store_true",
-                    help="Do NOT restrict crawl to the start URL's domain (default: restricted to parent domain + subdomains)")
+                    help="Do NOT restrict crawl to the start URL's domain")
     p.add_argument("--same-subdomain", action="store_true",
-                    help="Restrict crawl to the EXACT host of --url (e.g. beta.repo.example.com only, not www.example.com). Overrides parent-domain matching.")
+                    help="Restrict crawl to the EXACT host of --url")
     p.add_argument("--strip-query", action="store_true",
-                    help="Strip query strings from URLs before deduplication. Prevents crawl blowup on sites that generate unique URLs per tracking param. Default: off")
+                    help="Strip query strings from URLs before deduplication")
 
-    # Networking
-    p.add_argument("--timeout", type=float, default=30, help="Connect timeout in seconds (default: 30)")
-    p.add_argument("--read-timeout", type=float, default=120, help="Read timeout between chunks in seconds (default: 120)")
-    p.add_argument("--retries", type=int, default=3, help="Download attempts per file (default: 3)")
+    # Network
+    p.add_argument("--timeout", type=float, default=30,
+                    help="Connect timeout in seconds (default: 30)")
+    p.add_argument("--read-timeout", type=float, default=120,
+                    help="Read timeout between chunks in seconds (default: 120)")
+    p.add_argument("--retries", type=int, default=3,
+                    help="Download attempts per file (default: 3)")
 
     # JS handling
-    p.add_argument("--max-js-size", type=float, default=50, help="Max JS file size in MB (default: 50)")
+    p.add_argument("--max-js-size", type=float, default=50,
+                    help="Max JS file size in MB (default: 50)")
     p.add_argument("--max-chunks", type=int, default=0,
-                   help="Max recursive chunk downloads (0 = unlimited, default: 0)")
-    p.add_argument("--skip-sourcemaps", action="store_true", help="Skip .map / .js.map files")
+                    help="Max recursive chunk downloads (0 = unlimited)")
+    p.add_argument("--skip-sourcemaps", action="store_true",
+                    help="Skip .map / .js.map files")
     p.add_argument("--skip-framework", dest="skip_framework", action="store_true", default=True,
-                    help="Don't report endpoints found inside framework/vendor bundles (vendors*, runtime*, umi*, react*, etc.). Bundles are still downloaded and scanned for chunk discovery. Default: on")
+                    help="Skip endpoint extraction from framework bundles. Default: on")
     p.add_argument("--include-framework", dest="skip_framework", action="store_false",
-                    help="Include framework/vendor bundle contents in extracted endpoints (disables --skip-framework)")
+                    help="Include framework bundle endpoint extraction")
 
     # Auth
-    p.add_argument("--cookie", default=None, help="Inline cookie string, e.g. 'session=abc; csrf=xyz'")
-    p.add_argument("--cookie-file", default=None, help="Cookie file (Netscape format or plain name=value lines)")
+    p.add_argument("--cookie", default=None, help="Inline cookie string")
+    p.add_argument("--cookie-file", default=None, help="Cookie file (Netscape or plain)")
     p.add_argument("--token", default=None, help="Bearer/raw auth token")
     p.add_argument("--auth-type", default="Bearer", choices=["Bearer", "Basic", "None"],
                     help="Auth scheme for --token (default: Bearer)")
-    p.add_argument("--header", action="append", default=[], help="Custom header 'Name: Value' (repeatable)")
+    p.add_argument("--header", action="append", default=[], help="Custom header 'Name: Value'")
     p.add_argument("--user-agent", default=None, help="Override User-Agent header")
-    p.add_argument("--insecure", action="store_true", help="Disable SSL certificate verification")
+    p.add_argument("--insecure", action="store_true", help="Disable SSL verification")
 
-    # Output / behavior
-    p.add_argument("--verbose", action="store_true",
-                    help="Print full detailed log (every file, every chunk, every endpoint). Default: compact status line")
-    p.add_argument("--resume", action="store_true",
-                    help="Load existing state from --output dir before crawling, so an interrupted run can continue")
-    p.add_argument("--json", action="store_true",
-                    help="Also write a results.json summary to the output dir")
+    # Compression
+    p.add_argument("--no-compression", action="store_true",
+                    help="Send 'Accept-Encoding: identity' - bypasses all decompression issues. "
+                         "Slower on large bundles but 100%% reliable.")
+    p.add_argument("--compression", default="auto",
+                    choices=["auto", "brotli-zstd", "brotli", "zstd", "gzip", "none"],
+                    help="Force a specific Accept-Encoding. Default: auto (best available)")
+
+    # Parallelism / optimization
+    p.add_argument("--concurrency", type=int, default=6,
+                    help="Parallel download workers (default: 6). Set to 1 for sequential.")
+    p.add_argument("--preflight", action="store_true",
+                    help="HEAD-check chunk URLs before downloading (slower startup, fewer wasted GETs)")
+    p.add_argument("--no-preflight", dest="preflight", action="store_false",
+                    help="Skip HEAD preflight (default)")
+
+    # Output
+    p.add_argument("--verbose", action="store_true", help="Full detailed log")
+    p.add_argument("--resume", action="store_true", help="Resume from existing output dir")
+    p.add_argument("--json", action="store_true", help="Write results.json summary")
+
+    p.set_defaults(preflight=False)
     return p
 
 
-# ---- Session Builder ----
+# =============================================================================
+# Session Builder
+# =============================================================================
 
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -155,13 +210,32 @@ DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 CHROME_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
 }
+
+
+def _accept_encoding(args):
+    if args.no_compression or args.compression == "none":
+        return "identity"
+    if args.compression == "brotli-zstd":
+        return "gzip, deflate, br, zstd"
+    if args.compression == "brotli":
+        return "gzip, deflate, br"
+    if args.compression == "zstd":
+        return "gzip, deflate, zstd"
+    if args.compression == "gzip":
+        return "gzip, deflate"
+    # auto
+    parts = ["gzip", "deflate"]
+    if HAVE_BROTLI:
+        parts.append("br")
+    if HAVE_ZSTD:
+        parts.append("zstd")
+    return ", ".join(parts)
 
 
 def parse_cookie_string(s):
@@ -189,58 +263,75 @@ def parse_cookie_file(path):
             if "\t" in line:
                 fields = line.split("\t")
                 if len(fields) >= 7:
-                    name, val = fields[5], fields[6]
-                    cookies[name.strip()] = val.strip()
+                    cookies[fields[5].strip()] = fields[6].strip()
             elif "=" in line:
                 for part in line.split(";"):
                     part = part.strip()
                     if "=" in part:
-                        name, val = part.split("=", 1)
-                        cookies[name.strip()] = val.strip()
+                        k, v = part.split("=", 1)
+                        cookies[k.strip()] = v.strip()
     return cookies
 
 
-def build_session(args, start_url):
+def make_session(args, start_url, base_cookies=None):
+    """Create a fresh requests.Session configured with the CLI's auth and headers.
+    Each parallel worker calls this - Session objects are not thread-safe."""
     session = requests.Session()
     session.verify = not args.insecure
 
-    ua = args.user_agent or DEFAULT_UA
     headers = dict(CHROME_HEADERS)
-    headers["User-Agent"] = ua
+    headers["User-Agent"] = args.user_agent or DEFAULT_UA
+    headers["Accept-Encoding"] = _accept_encoding(args)
+
     for h in args.header:
         if ":" in h:
             name, val = h.split(":", 1)
             headers[name.strip()] = val.strip()
 
-    auth_header_set = False
-    if args.token and args.auth_type != "None":
-        headers["Authorization"] = "%s %s" % (args.auth_type, args.token)
-        auth_header_set = True
-    elif args.token and args.auth_type == "None":
-        headers["Authorization"] = args.token
-        auth_header_set = True
+    if args.token:
+        if args.auth_type and args.auth_type.lower() != "none":
+            headers["Authorization"] = "%s %s" % (args.auth_type, args.token)
+        else:
+            headers["Authorization"] = args.token
 
     session.headers.update(headers)
 
-    cookies = {}
-    cookies.update(parse_cookie_string(args.cookie))
-    cookies.update(parse_cookie_file(args.cookie_file))
-
     parsed = urllib.parse.urlsplit(start_url)
     host = parsed.hostname or ""
-    parent_domain = ".".join(host.split(".")[-2:]) if host.count(".") >= 1 else host
+    parent = ".".join(host.split(".")[-2:]) if host.count(".") >= 1 else host
 
-    for name, val in cookies.items():
-        session.cookies.set(name, val, domain=host)
-        if parent_domain and parent_domain != host:
-            session.cookies.set(name, val, domain="." + parent_domain)
+    cli_cookies = {}
+    cli_cookies.update(parse_cookie_string(args.cookie))
+    cli_cookies.update(parse_cookie_file(args.cookie_file))
 
-    return session, cookies, auth_header_set
+    for name, val in cli_cookies.items():
+        session.cookies.set(name, val, domain=host, path="/")
+        if parent and parent != host:
+            session.cookies.set(name, val, domain="." + parent, path="/")
+
+    if base_cookies:
+        for c in base_cookies:
+            try:
+                session.cookies.set_cookie(c)
+            except Exception:
+                pass
+
+    return session
 
 
-# ---- Helper Functions ----
+def build_session(args, start_url):
+    """Return (session, cookie_count, auth_header_set)."""
+    session = make_session(args, start_url)
+    n = len(session.cookies)
+    auth_set = "Authorization" in session.headers
+    return session, n, auth_set
 
-_STRIP_QUERY = False  # module-level, set in main() from args
+
+# =============================================================================
+# Small helpers
+# =============================================================================
+
+_STRIP_QUERY = False
 
 
 def ensure_dirs(output_dir):
@@ -258,20 +349,17 @@ def registrable_domain(host):
 
 
 def same_domain(url, base_domain):
-    """True if url's host equals base_domain or is a subdomain of it,
-    matched on registrable domain (e.g. api.example.com vs example.com)."""
     host = domain_of(url)
-    return host == base_domain or host.endswith("." + base_domain) or \
-        registrable_domain(host) == registrable_domain(base_domain)
+    return (host == base_domain
+            or host.endswith("." + base_domain)
+            or registrable_domain(host) == registrable_domain(base_domain))
 
 
 def same_host(url, base_host):
-    """True only if url's host exactly equals base_host (case-insensitive)."""
     return domain_of(url) == base_host.lower()
 
 
 def host_allowed(url, args, base_domain):
-    """Unified domain check that honors --all-domains and --same-subdomain."""
     if args.all_domains:
         return True
     if args.same_subdomain:
@@ -289,7 +377,7 @@ def normalize_url(candidate, base_url):
         joined = urllib.parse.urljoin(base_url, candidate)
     except Exception:
         return None
-    joined, _frag = urllib.parse.urldefrag(joined)
+    joined, _ = urllib.parse.urldefrag(joined)
     if _STRIP_QUERY:
         joined = urllib.parse.urlsplit(joined)._replace(query="").geturl()
     return joined
@@ -298,10 +386,9 @@ def normalize_url(candidate, base_url):
 STATIC_EXTS = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2",
                ".ttf", ".eot", ".ico", ".pdf", ".xml", ".txt", ".html", ".htm")
 
-
 FRAMEWORK_NAME_RE = re.compile(
     r'^(vendors?|runtime|umi|polyfill|react(-dom)?|redux|moment|antd|lodash|'
-    r'core-js|regenerator|webpack)[-.]',
+    r'core-js|regenerator|webpack|rolldown)[-.]',
     re.IGNORECASE,
 )
 
@@ -312,22 +399,20 @@ def is_framework_bundle(url):
 
 
 def is_static_asset(url):
-    path = urllib.parse.urlsplit(url).path.lower()
-    return path.endswith(STATIC_EXTS)
+    return urllib.parse.urlsplit(url).path.lower().endswith(STATIC_EXTS)
 
 
 def is_js_url(url):
-    path = urllib.parse.urlsplit(url).path.lower()
-    return path.endswith(".js")
+    return urllib.parse.urlsplit(url).path.lower().endswith((".js", ".mjs", ".cjs"))
 
 
 def safe_filename(url, output_dir):
     parsed = urllib.parse.urlsplit(url)
     name = os.path.basename(parsed.path) or "index.js"
-    h = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
     target = os.path.join(output_dir, "js_files", name)
     if os.path.exists(target):
         base, ext = os.path.splitext(name)
+        h = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
         name = "%s.%s%s" % (base, h, ext)
         target = os.path.join(output_dir, "js_files", name)
     return target
@@ -349,12 +434,116 @@ INTERESTING_KEYWORDS = ("auth", "login", "api", "token", "admin", "user", "passw
 
 
 def tag_interesting(endpoint):
-    lower = endpoint.lower()
-    hits = [kw for kw in INTERESTING_KEYWORDS if kw in lower]
-    return hits
+    low = endpoint.lower()
+    return [kw for kw in INTERESTING_KEYWORDS if kw in low]
 
 
-# ---- Endpoint Extraction ----
+# =============================================================================
+# Compression / decode
+# =============================================================================
+
+def _looks_like_text(raw):
+    if not raw:
+        return False
+    sample = raw[:512]
+    text_chars = sum(1 for b in sample if 0x20 <= b < 0x7f or b in (0x09, 0x0a, 0x0d))
+    return (text_chars / len(sample)) > 0.90
+
+
+def _decompress_bytes(raw):
+    """Return (data, was_compressed). Never corrupts plain text."""
+    if not raw:
+        return raw, False
+    if _looks_like_text(raw):
+        return raw, False
+
+    # gzip
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            return gzip.decompress(raw), True
+        except Exception:
+            pass
+
+    # zlib
+    if raw[:1] == b"\x78":
+        try:
+            return zlib.decompress(raw), True
+        except Exception:
+            pass
+
+    # zstd (with magic)
+    if HAVE_ZSTD and raw[:4] == b"\x28\xb5\x2f\xfd":
+        try:
+            return _zstd_mod.ZstdDecompressor().decompress(raw), True
+        except Exception:
+            pass
+
+    # zstd (magicless, try after other checks)
+    if HAVE_ZSTD:
+        try:
+            out = _zstd_mod.ZstdDecompressor().decompress(raw, max_output_size=200 * 1024 * 1024)
+            if out and _looks_like_text(out):
+                return out, True
+        except Exception:
+            pass
+
+    # brotli
+    if HAVE_BROTLI:
+        try:
+            out = _brotli_mod.decompress(raw)
+            if out and _looks_like_text(out):
+                return out, True
+        except Exception:
+            pass
+
+    # raw deflate
+    try:
+        out = zlib.decompress(raw, -15)
+        if out and _looks_like_text(out):
+            return out, True
+    except Exception:
+        pass
+
+    return raw, False
+
+
+def load_js_text(path):
+    """Read a JS file from disk, decompress if needed, and persist decompressed form.
+    Returns (text, was_decompressed) or (None, False) if still unreadable."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None, False
+    if not raw:
+        return None, False
+
+    decoded, was = _decompress_bytes(raw)
+    if was:
+        try:
+            with open(path, "wb") as f:
+                f.write(decoded)
+        except OSError:
+            pass
+
+    try:
+        text = decoded.decode("utf-8", errors="ignore")
+    except Exception:
+        return None, was
+
+    if not text:
+        return None, was
+
+    sample = text[:2000]
+    printable = sum(1 for c in sample if c.isprintable() or c in "\n\r\t")
+    if (printable / len(sample)) < 0.85:
+        return None, was
+    return text, was
+
+
+# =============================================================================
+# Endpoint extraction
+# =============================================================================
 
 ENDPOINT_PATTERNS = [
     re.compile(r'https?://[^\s"\'<>\\)\]]+'),
@@ -377,20 +566,18 @@ def extract_endpoints_from_text(text, base_url):
             if not candidate:
                 continue
             url = normalize_url(candidate, base_url)
-            if not url:
-                continue
-            if is_js_url(url):
-                continue
-            if is_static_asset(url):
+            if not url or is_js_url(url) or is_static_asset(url):
                 continue
             found.add(url)
     return found
 
 
-# ---- Chunk Extraction ----
+# =============================================================================
+# Chunk extraction
+# =============================================================================
 
 CHUNK_SIGNAL_PATTERNS = [
-    re.compile(r'import\(\s*["\']([^"\']+\.js)["\']\s*\)'),
+    re.compile(r'import\(\s*["\']([^"\']+\.m?js)["\']\s*\)'),
     re.compile(r'__webpack_require__\.p\s*\+\s*["\']([^"\']+\.js)["\']'),
     re.compile(r'["\']([a-zA-Z0-9_\-./]+\.async\.js)["\']'),
     re.compile(r'["\']([pP]__[a-zA-Z0-9_]+)["\']'),
@@ -399,30 +586,44 @@ CHUNK_SIGNAL_PATTERNS = [
 WEBPACK_ID_HASH_MAP_RE = re.compile(r'\{(\s*"?[0-9]+"?\s*:\s*"[0-9a-fA-F]{6,}"\s*,?\s*)+\}')
 WEBPACK_ID_HASH_ENTRY_RE = re.compile(r'"?([0-9]+)"?\s*:\s*"([0-9a-fA-F]{6,})"')
 
+CHUNK_NAME_VALID = re.compile(
+    r'('
+    r'\.async\.js$'
+    r'|^vendors.*\.js$'
+    r'|^chunk[-.][0-9a-fA-F]+\.m?js$'
+    r'|^runtime\.[0-9a-fA-F]+\.m?js$'
+    r'|^webpack-.*'
+    r'|\.[0-9a-fA-F]{6,}\.m?js$'
+    r'|[-.][a-zA-Z0-9_-]{6,}\.m?js$'
+    r')'
+)
+
+
+def looks_like_valid_chunk_name(name):
+    return bool(CHUNK_NAME_VALID.search(name))
+
 
 def extract_id_hash_chunks(text, base_url, session=None, args=None, state=None):
     found = set()
-    known_suffix = state.get("chunk_suffix") if state is not None else None
+    known_suffix = state.get("chunk_suffix") if state else None
 
     for map_match in WEBPACK_ID_HASH_MAP_RE.finditer(text):
-        block = map_match.group(0)
-        entries = WEBPACK_ID_HASH_ENTRY_RE.findall(block)
+        entries = WEBPACK_ID_HASH_ENTRY_RE.findall(map_match.group(0))
         if len(entries) < 2:
             continue
 
-        if known_suffix is None and session is not None and args is not None and state is not None:
+        if known_suffix is None and session and args and state:
             probe_id, probe_hash = entries[0]
             for suffix in (".async.js", ".chunk.js"):
-                candidate = "%s.%s%s" % (probe_id, probe_hash, suffix)
-                probe_url = normalize_url(candidate, base_url)
+                probe_url = normalize_url("%s.%s%s" % (probe_id, probe_hash, suffix), base_url)
                 if not probe_url:
                     continue
                 try:
-                    resp = session.head(probe_url, timeout=(args.timeout, args.timeout), allow_redirects=True)
+                    resp = session.head(probe_url, timeout=(args.timeout, args.timeout),
+                                        allow_redirects=True)
                     if resp.status_code != 405 and 200 <= resp.status_code < 400:
                         known_suffix = suffix
                         state["chunk_suffix"] = suffix
-                        REPORTER.detail("     Detected chunk suffix: %s" % suffix)
                         break
                 except requests.exceptions.RequestException:
                     continue
@@ -430,27 +631,10 @@ def extract_id_hash_chunks(text, base_url, session=None, args=None, state=None):
         suffixes = (known_suffix,) if known_suffix else (".async.js", ".chunk.js")
         for chunk_id, chunk_hash in entries:
             for suffix in suffixes:
-                candidate = "%s.%s%s" % (chunk_id, chunk_hash, suffix)
-                url = normalize_url(candidate, base_url)
+                url = normalize_url("%s.%s%s" % (chunk_id, chunk_hash, suffix), base_url)
                 if url:
                     found.add(url)
     return found
-
-
-CHUNK_NAME_VALID = re.compile(
-    r'('
-    r'\.async\.js$'
-    r'|^vendors.*\.js$'
-    r'|chunk[-.][0-9a-fA-F]+\.js$'
-    r'|runtime\.[0-9a-fA-F]+\.js$'
-    r'|^webpack-.*'
-    r'|\.[0-9a-fA-F]{6,}\.js$'
-    r')'
-)
-
-
-def looks_like_valid_chunk_name(name):
-    return bool(CHUNK_NAME_VALID.search(name))
 
 
 def extract_chunks_from_text(text, base_url, session=None, args=None, state=None):
@@ -466,14 +650,11 @@ def extract_chunks_from_text(text, base_url, session=None, args=None, state=None
             if not looks_like_valid_chunk_name(name):
                 continue
             url = normalize_url(candidate, base_url)
-            if not url:
-                continue
-            found.add(url)
+            if url:
+                found.add(url)
     found |= extract_id_hash_chunks(text, base_url, session=session, args=args, state=state)
     return found
 
-
-# ---- SPA Route Extraction ----
 
 SPA_ROUTE_RE = re.compile(r'[pP]__([a-zA-Z0-9_]+)__([a-zA-Z0-9_]+)\.async\.js$')
 
@@ -483,67 +664,45 @@ def derive_spa_route(chunk_url, start_url):
     m = SPA_ROUTE_RE.search(name)
     if not m:
         return None
-    section, page = m.group(1), m.group(2)
-    return start_url.rstrip("/") + "/#/" + section + "/" + page
+    return start_url.rstrip("/") + "/#/" + m.group(1) + "/" + m.group(2)
 
 
-# ---- JS Download (streaming + retry) ----
+# =============================================================================
+# JS download
+# =============================================================================
 
-def human_size(num_bytes):
-    return "%.2f MB" % (num_bytes / (1024.0 * 1024.0))
+def human_size(n):
+    return "%.2f MB" % (n / (1024.0 * 1024.0))
 
 
-def download_js(session, url, referer, args, dest_path, state):
+def download_js(session, url, referer, args, dest_path):
+    """Download one JS file. Returns dest_path on success, None on failure."""
     max_bytes = int(args.max_js_size * 1024 * 1024)
-    headers = {}
-    if referer:
-        headers["Referer"] = referer
+    headers = {"Referer": referer} if referer else {}
 
     for attempt in range(1, args.retries + 1):
         try:
-            resp = session.get(
-                url, headers=headers, stream=True,
-                timeout=(args.timeout, args.read_timeout),
-            )
+            resp = session.get(url, headers=headers, stream=True,
+                               timeout=(args.timeout, args.read_timeout))
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             if attempt < args.retries:
-                wait = 2 ** attempt
-                REPORTER.detail("     Network error (%s), retrying in %ds (%d/%d)..." %
-                                 (type(e).__name__, wait, attempt, args.retries))
-                time.sleep(wait)
+                time.sleep(2 ** attempt)
                 continue
-            REPORTER.log("     Failed after %d attempts: %s" % (args.retries, e), always=True)
+            REPORTER.detail("     failed %s: %s" % (url, e))
             return None
 
         if resp.status_code >= 500:
             resp.close()
             if attempt < args.retries:
-                wait = 2 ** attempt
-                REPORTER.detail("     Server error %d, retrying in %ds (%d/%d)..." %
-                                 (resp.status_code, wait, attempt, args.retries))
-                time.sleep(wait)
+                time.sleep(2 ** attempt)
                 continue
-            REPORTER.log("     Failed after %d attempts: HTTP %d" % (args.retries, resp.status_code), always=True)
             return None
 
         if resp.status_code >= 400:
             resp.close()
-            REPORTER.detail("     HTTP %d, not retrying (permanent)" % resp.status_code)
             return None
 
-        declared = resp.headers.get("Content-Length")
-        if declared:
-            try:
-                declared_mb = int(declared) / (1024.0 * 1024.0)
-                REPORTER.detail("     %.2f MB declared, streaming..." % declared_mb)
-            except ValueError:
-                REPORTER.detail("     streaming...")
-        else:
-            REPORTER.detail("     streaming (size unknown)...")
-
         total = 0
-        last_reported = 0
-        start_time = time.time()
         try:
             with open(dest_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=65536):
@@ -551,7 +710,6 @@ def download_js(session, url, referer, args, dest_path, state):
                         continue
                     total += len(chunk)
                     if total > max_bytes:
-                        REPORTER.log("     Exceeded max JS size (%.0f MB), aborting download" % args.max_js_size, always=True)
                         resp.close()
                         try:
                             os.remove(dest_path)
@@ -559,79 +717,173 @@ def download_js(session, url, referer, args, dest_path, state):
                             pass
                         return None
                     f.write(chunk)
-                    if total - last_reported >= 512 * 1024:
-                        REPORTER.status("downloading %s -- %.2f MB" % (os.path.basename(dest_path), total / (1024.0 * 1024.0)))
-                        last_reported = total
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             resp.close()
             if attempt < args.retries:
-                wait = 2 ** attempt
-                REPORTER.detail("     Stream interrupted (%s), retrying in %ds (%d/%d)..." %
-                                 (type(e).__name__, wait, attempt, args.retries))
-                time.sleep(wait)
+                time.sleep(2 ** attempt)
                 continue
-            REPORTER.log("     Failed after %d attempts: %s" % (args.retries, e), always=True)
+            REPORTER.detail("     stream error %s: %s" % (url, e))
             return None
         finally:
             resp.close()
 
-        elapsed = max(time.time() - start_time, 0.001)
-        rate_kb = (total / 1024.0) / elapsed
-        REPORTER.detail("     Saved: %s (%s in %.1fs, %d KB/s)" %
-                         (dest_path, human_size(total), elapsed, int(rate_kb)))
         return dest_path
 
     return None
 
 
-# ---- Chunk Pre-flight (parallel HEAD) ----
+# =============================================================================
+# Parallel JS download + analysis
+# =============================================================================
 
-def head_check(session, url, args):
-    try:
-        resp = session.head(url, timeout=(args.timeout, args.timeout), allow_redirects=True)
-        return url, resp.status_code
-    except requests.exceptions.RequestException:
-        return url, None
+def _download_worker(url, referer, args, dest_dir, master_cookies):
+    """Runs in a worker thread. Returns (url, path or None, text or None)."""
+    worker = make_session(args, args.url, base_cookies=master_cookies)
+    dest = safe_filename(url, dest_dir)
+    result = download_js(worker, url, referer, args, dest)
+    if not result:
+        return (url, None, None)
+    text, _was = load_js_text(result)
+    return (url, result, text)
 
 
-def preflight_chunks(session, urls, args, state):
-    urls = list(urls)
+def parallel_download_batch(urls, referer, args, state, master_cookies):
+    """
+    Download a batch of URLs in parallel. Analyzes each JS body for endpoints
+    and chunks, updating shared state from the main thread only.
+
+    Returns set of newly discovered chunk URLs.
+    """
     if not urls:
-        return [], []
+        return set()
 
-    REPORTER.status("pre-checking %d chunk URLs (HEAD)..." % len(urls))
+    # Filter candidates on the main thread
+    todo = [u for u in urls
+            if u not in state["downloaded_urls"]
+            and u not in state["dead_chunks"]]
+    if not todo:
+        return set()
+
+    # Respect --max-chunks
+    if args.max_chunks:
+        remaining = args.max_chunks - len(state["downloaded_urls"])
+        if remaining <= 0:
+            return set()
+        todo = todo[:remaining]
+
+    # Optional preflight
+    if args.preflight:
+        valid = _preflight(todo, args, state)
+        todo = valid
+        if not todo:
+            return set()
+
+    # Register URLs as downloaded (files will be added once complete)
+    for u in todo:
+        state["downloaded_urls"].add(u)
+        add_new(state, "js_files", state["jsfiles_path"], u)
+
+    REPORTER.counters["js_files"] = len(state["js_files"])
+
+    workers = max(1, min(args.concurrency, len(todo)))
+    discovered_chunks = set()
+
+    if workers == 1:
+        # Sequential fallback
+        for u in todo:
+            REPORTER.status("downloading %s" % os.path.basename(urllib.parse.urlsplit(u).path))
+            url, path, text = _download_worker(u, referer, args, state["output_dir"], master_cookies)
+            if path is None:
+                state["dead_chunks"].add(url)
+                continue
+            if text is None:
+                REPORTER.log("  binary JS unreadable: %s (try --no-compression)" % url, always=True)
+                continue
+            discovered_chunks |= _analyze_js(url, text, state, args)
+        return discovered_chunks
+
+    # Parallel
+    done = 0
+    total = len(todo)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(_download_worker, u, referer, args, state["output_dir"], master_cookies): u
+            for u in todo
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            url = futures[fut]
+            done += 1
+            REPORTER.status("downloading %d/%d (%.0f%%)" % (done, total, 100.0 * done / total))
+            try:
+                r_url, r_path, r_text = fut.result()
+            except Exception as e:
+                REPORTER.detail("     worker crash %s: %s" % (url, e))
+                state["dead_chunks"].add(url)
+                continue
+
+            if r_path is None:
+                state["dead_chunks"].add(url)
+                continue
+            if r_text is None:
+                REPORTER.log("  binary JS unreadable: %s (try --no-compression)" % r_url, always=True)
+                continue
+            discovered_chunks |= _analyze_js(r_url, r_text, state, args)
+
+    return discovered_chunks
+
+
+def _analyze_js(url, text, state, args):
+    """Extract endpoints and chunks from JS text. Returns new chunk URLs."""
+    skip_endpoints = args.skip_framework and is_framework_bundle(url)
+
+    if not skip_endpoints:
+        endpoints = extract_endpoints_from_text(text, url)
+        for ep in endpoints:
+            add_new(state, "js_endpoints", state["jsendpoints_path"], ep)
+            add_new(state, "endpoints", state["endpoints_path"], ep)
+            hits = tag_interesting(ep)
+            if hits:
+                REPORTER.counters["interesting"] += 1
+                REPORTER.log("     [INTERESTING] %s (%s)" % (ep, ", ".join(hits)), always=True)
+
+    REPORTER.counters["endpoints"] = len(state["endpoints"])
+
+    chunks = extract_chunks_from_text(text, url, session=SESSION, args=args, state=state)
+    new_chunks = set()
+    for c in chunks:
+        if c in state["dead_chunks"]:
+            continue
+        if add_new(state, "js_chunks", state["jschunks_path"], c):
+            new_chunks.add(c)
+
+    REPORTER.counters["chunks"] = len(state["js_chunks"])
+    return new_chunks
+
+
+def _preflight(urls, args, state):
+    """Quick HEAD check to skip dead URLs. Optional via --preflight."""
+    def check(u):
+        try:
+            r = SESSION.head(u, timeout=(args.timeout, args.timeout), allow_redirects=True)
+            return u, r.status_code
+        except Exception:
+            return u, None
+
     valid = []
-    dead = []
-    head_unsupported = False
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(head_check, session, u, args): u for u in urls}
-            for fut in concurrent.futures.as_completed(futures):
-                url, status = fut.result()
-                if status is None:
-                    head_unsupported = True
-                    continue
-                if status == 405:
-                    head_unsupported = True
-                    continue
-                if 200 <= status < 400:
-                    valid.append(url)
-                else:
-                    dead.append(url)
-                    state["dead_chunks"].add(url)
-    except Exception:
-        head_unsupported = True
-
-    if head_unsupported and not valid and not dead:
-        REPORTER.detail("  HEAD not supported, falling back to sequential GET with tightened filter.")
-        return urls, []
-
-    REPORTER.detail("  Valid: %d  Dead (404/skipped): %d" % (len(valid), len(dead)))
-    return valid, dead
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for url, status in ex.map(check, urls):
+            if status is None or status == 405:
+                valid.append(url)  # HEAD unsupported, try GET
+            elif 200 <= status < 400:
+                valid.append(url)
+            else:
+                state["dead_chunks"].add(url)
+    return valid
 
 
-# ---- Output State ----
+# =============================================================================
+# State
+# =============================================================================
 
 def new_state(output_dir):
     return {
@@ -642,6 +894,7 @@ def new_state(output_dir):
         "js_chunks": set(),
         "spa_routes": set(),
         "dead_chunks": set(),
+        "downloaded_urls": set(),
         "chunk_suffix": None,
         "output_dir": output_dir,
         "endpoints_path": os.path.join(output_dir, "endpoints.txt"),
@@ -675,15 +928,24 @@ def load_resume_state(state):
                 if line:
                     state[set_key].add(line)
                     loaded += 1
+
     js_dir = os.path.join(state["output_dir"], "js_files")
-    downloaded_urls = set()
+    redo = 0
     if os.path.isdir(js_dir):
-        existing_names = set(os.listdir(js_dir))
+        existing = set(os.listdir(js_dir))
         for url in state["js_files"]:
             name = os.path.basename(urllib.parse.urlsplit(url).path)
-            if name in existing_names:
-                downloaded_urls.add(url)
-    return loaded, downloaded_urls
+            if name not in existing:
+                continue
+            full = os.path.join(js_dir, name)
+            text, _was = load_js_text(full)
+            if text is not None:
+                state["downloaded_urls"].add(url)
+            else:
+                redo += 1
+    if redo:
+        REPORTER.log("Resume: %d unreadable file(s) will be re-downloaded." % redo, always=True)
+    return loaded
 
 
 def add_new(state, key, path, item):
@@ -710,13 +972,8 @@ def write_json_results(state, args):
         "js_endpoints": sorted(state["js_endpoints"]),
         "js_chunks": sorted(state["js_chunks"]),
         "spa_routes": sorted(state["spa_routes"]),
-        "counts": {
-            "pages_crawled": len(state["pages_crawled"]),
-            "endpoints": len(state["endpoints"]),
-            "js_files": len(state["js_files"]),
-            "js_chunks": len(state["js_chunks"]),
-            "js_endpoints": len(state["js_endpoints"]),
-        },
+        "counts": {k: len(state[k]) for k in
+                   ("pages_crawled", "endpoints", "js_files", "js_chunks", "js_endpoints")},
     }
     path = os.path.join(state["output_dir"], "results.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -724,7 +981,16 @@ def write_json_results(state, args):
     return path
 
 
-# ---- HTML Parsing ----
+# =============================================================================
+# HTML parsing
+# =============================================================================
+
+def _rel_list(tag):
+    rel = tag.get("rel", [])
+    if isinstance(rel, list):
+        return " ".join(rel).lower()
+    return str(rel).lower()
+
 
 def extract_links_and_scripts(html, base_url):
     scripts = set()
@@ -741,6 +1007,15 @@ def extract_links_and_scripts(html, base_url):
                     scripts.add(url)
             elif tag.string:
                 inline_js.append(tag.string)
+        for tag in soup.find_all("link"):
+            href = tag.get("href")
+            if not href:
+                continue
+            if not any(k in _rel_list(tag) for k in ("modulepreload", "preload", "prefetch")):
+                continue
+            url = normalize_url(href, base_url)
+            if url and is_js_url(url):
+                scripts.add(url)
         for tag in soup.find_all("a"):
             href = tag.get("href")
             if href:
@@ -755,6 +1030,13 @@ def extract_links_and_scripts(html, base_url):
         for m in re.finditer(r'<script[^>]*>(.*?)</script>', html, re.IGNORECASE | re.DOTALL):
             if m.group(1).strip():
                 inline_js.append(m.group(1))
+        for m in re.finditer(
+            r'<link\b[^>]*\brel=["\']([^"\']*?(?:modulepreload|preload|prefetch)[^"\']*)["\'][^>]*\bhref=["\']([^"\']+)["\']',
+            html, re.IGNORECASE,
+        ):
+            url = normalize_url(m.group(2), base_url)
+            if url and is_js_url(url):
+                scripts.add(url)
         for m in re.finditer(r'<a[^>]*\bhref=["\']([^"\']+)["\']', html, re.IGNORECASE):
             url = normalize_url(m.group(1), base_url)
             if url:
@@ -763,98 +1045,30 @@ def extract_links_and_scripts(html, base_url):
     return scripts, links, inline_js
 
 
-def process_js_content(text, source_url, state, args, session=None):
-    skip_endpoints = args.skip_framework and is_framework_bundle(source_url)
-
-    endpoints = set() if skip_endpoints else extract_endpoints_from_text(text, source_url)
-    new_endpoints = 0
-    t0 = time.time()
-    for ep in endpoints:
-        if add_new(state, "js_endpoints", state["jsendpoints_path"], ep):
-            new_endpoints += 1
-        add_new(state, "endpoints", state["endpoints_path"], ep)
-        hits = tag_interesting(ep)
-        if hits:
-            REPORTER.counters["interesting"] += 1
-            REPORTER.log("     [INTERESTING] %s (contains: %s)" % (ep, ", ".join(hits)), always=True)
-    elapsed = time.time() - t0
-    if skip_endpoints:
-        REPORTER.detail("     Skipping endpoint extraction (framework/vendor bundle)")
-    else:
-        REPORTER.detail("     Found %d endpoints (%d new) in %.1fs" % (len(endpoints), new_endpoints, elapsed))
-    REPORTER.counters["endpoints"] = len(state["endpoints"])
-
-    chunks = extract_chunks_from_text(text, source_url, session=session, args=args, state=state)
-    new_chunks = 0
-    for c in chunks:
-        if c in state["dead_chunks"]:
-            continue
-        if add_new(state, "js_chunks", state["jschunks_path"], c):
-            new_chunks += 1
-    REPORTER.counters["chunks"] = len(state["js_chunks"])
-    REPORTER.detail("     Found %d JS chunks (%d new)" % (len(chunks), new_chunks))
-    REPORTER.live_status()
-    return chunks
+def process_inline_js(text, source_url, state, args):
+    skip = args.skip_framework and is_framework_bundle(source_url)
+    if not skip:
+        for ep in extract_endpoints_from_text(text, source_url):
+            add_new(state, "js_endpoints", state["jsendpoints_path"], ep)
+            add_new(state, "endpoints", state["endpoints_path"], ep)
+    for c in extract_chunks_from_text(text, source_url, session=SESSION, args=args, state=state):
+        add_new(state, "js_chunks", state["jschunks_path"], c)
 
 
-def handle_js_file(session, url, referer, args, state, downloaded_urls):
-    if url in downloaded_urls:
-        return set()
-    if url in state["dead_chunks"]:
-        return set()
-    if args.skip_sourcemaps and (url.endswith(".map") or url.endswith(".js.map")):
-        return set()
-    if args.max_chunks and len(downloaded_urls) >= args.max_chunks:
-        return set()
+# =============================================================================
+# BFS crawl
+# =============================================================================
 
-    downloaded_urls.add(url)
-    add_new(state, "js_files", state["jsfiles_path"], url)
-    REPORTER.counters["js_files"] = len(state["js_files"])
-
-    dest_path = safe_filename(url, state["output_dir"])
-    REPORTER.detail("  JS: %s" % url)
-    REPORTER.status("downloading %s" % os.path.basename(dest_path))
-    result = download_js(session, url, referer, args, dest_path, state)
-    if not result:
-        state["dead_chunks"].add(url)
-        return set()
-
-    try:
-        size = os.path.getsize(result)
-        REPORTER.detail("     Analyzing %s of JS..." % human_size(size))
-        with open(result, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
-    except OSError as e:
-        REPORTER.log("     Could not read downloaded file: %s" % e, always=True)
-        return set()
-
-    chunks = process_js_content(text, url, state, args, session=session)
-
-    for chunk_url in chunks:
-        route = derive_spa_route(chunk_url, args.url)
-        if route:
-            add_new(state, "spa_routes", state["routes_path"], route)
-
-    return chunks
+SESSION = None  # master session, set in main()
+MASTER_COOKIES = []  # snapshot of cookies for worker sessions
 
 
-# ---- Page Crawl (iterative BFS) ----
-
-def crawl_page(session, start_url, start_depth, args, state, base_domain, visited, downloaded_urls):
-    """Iterative breadth-first crawl. Uses an explicit queue instead of
-    recursion so deep link structures cannot overflow Python's stack.
-
-    Domain scope is controlled by three flags:
-      --all-domains       : no restriction
-      --same-subdomain    : exact host only
-      (default)           : parent registrable domain + its subdomains
-    """
-    queue = deque()
-    queue.append((start_url, start_depth))
+def crawl(args, state, base_domain):
+    visited = set(state["pages_crawled"])
+    queue = deque([(args.url, 0)])
 
     while queue:
         url, depth = queue.popleft()
-
         if url in visited:
             continue
         if args.depth is not None and depth > args.depth:
@@ -863,51 +1077,65 @@ def crawl_page(session, start_url, start_depth, args, state, base_domain, visite
             continue
 
         visited.add(url)
-        label = "[%d/%s]" % (depth, str(args.depth) if args.depth is not None else "inf")
+        label = "[%d/%s]" % (depth, args.depth if args.depth is not None else "inf")
         REPORTER.log("\nCrawling %s: %s" % (label, url), always=True)
         REPORTER.counters["pages"] = len(state["pages_crawled"]) + 1
 
         try:
-            resp = session.get(url, timeout=(args.timeout, args.read_timeout),
-                               allow_redirects=True)
+            resp = SESSION.get(url, timeout=(args.timeout, args.read_timeout), allow_redirects=True)
         except requests.exceptions.RequestException as e:
             REPORTER.log("  Failed to fetch: %s" % e, always=True)
             continue
 
         final_url = resp.url
-        if "login" in final_url.lower() or "signin" in final_url.lower():
-            if "login" not in url.lower() and "signin" not in url.lower():
-                REPORTER.log("  WARNING: redirected to login/signin page -- auth may NOT be active.", always=True)
+        if ("login" in final_url.lower() or "signin" in final_url.lower()) \
+                and "login" not in url.lower() and "signin" not in url.lower():
+            REPORTER.log("  WARNING: redirected to login -- auth may NOT be active.", always=True)
 
         add_new(state, "pages_crawled", state["pages_path"], url)
         add_new(state, "endpoints", state["endpoints_path"], url)
 
-        content_type = resp.headers.get("Content-Type", "")
-        if "text/html" not in content_type and not resp.text.strip().startswith("<"):
+        ctype = resp.headers.get("Content-Type", "")
+        if "text/html" not in ctype and not resp.text.strip().startswith("<"):
             continue
 
         html = resp.text
         scripts, links, inline_js = extract_links_and_scripts(html, final_url)
 
+        # Inline <script> bodies
         for block in inline_js:
-            process_js_content(block, final_url, state, args, session=session)
+            process_inline_js(block, final_url, state, args)
 
+        # Collect link endpoints
         for link in links:
             add_new(state, "endpoints", state["endpoints_path"], link)
 
-        all_chunks = set()
+        # Register <script> URLs (even before download, so they show in output)
         for script_url in scripts:
             add_new(state, "js_files", state["jsfiles_path"], script_url)
             add_new(state, "endpoints", state["endpoints_path"], script_url)
 
-        for script_url in sorted(scripts):
-            found = handle_js_file(session, script_url, final_url, args,
-                                   state, downloaded_urls)
-            all_chunks |= found
+        # Download + analyze scripts in parallel
+        chunk_queue = set(parallel_download_batch(scripts, final_url, args, state, MASTER_COOKIES))
 
-        process_chunk_queue(session, all_chunks, final_url, args, state, downloaded_urls)
+        # Process chunk queue recursively
+        while chunk_queue:
+            if args.max_chunks and len(state["downloaded_urls"]) >= args.max_chunks:
+                REPORTER.log("  Max chunk limit (%d) reached." % args.max_chunks, always=True)
+                break
+            batch = list(chunk_queue)[:max(1, args.concurrency * 2)]
+            for u in batch:
+                chunk_queue.discard(u)
+            new_chunks = parallel_download_batch(batch, final_url, args, state, MASTER_COOKIES)
+            chunk_queue |= new_chunks
 
-        # Enqueue children (BFS) instead of recursing
+        # Derive SPA routes from discovered chunk names
+        for chunk_url in state["js_chunks"]:
+            route = derive_spa_route(chunk_url, args.url)
+            if route:
+                add_new(state, "spa_routes", state["routes_path"], route)
+
+        # Enqueue child pages (BFS)
         if args.depth is None or depth < args.depth:
             for link in sorted(links):
                 if not host_allowed(link, args, base_domain):
@@ -916,55 +1144,24 @@ def crawl_page(session, start_url, start_depth, args, state, base_domain, visite
                     queue.append((link, depth + 1))
 
 
-# ---- Chunk Queue Processor ----
+# =============================================================================
+# Probe
+# =============================================================================
 
-def process_chunk_queue(session, initial_chunks, referer, args, state, downloaded_urls):
-    queue = set(initial_chunks)
-    seen_in_queue = set(queue)
-
-    while queue and (not args.max_chunks or len(downloaded_urls) < args.max_chunks):
-        batch = list(queue)[:64]
-        for u in batch:
-            queue.discard(u)
-
-        candidates = [u for u in batch if u not in downloaded_urls and u not in state["dead_chunks"]]
-        if not candidates:
-            continue
-
-        valid, _dead = preflight_chunks(session, candidates, args, state)
-
-        for chunk_url in valid:
-            if args.max_chunks and len(downloaded_urls) >= args.max_chunks:
-                REPORTER.log("  Max chunk limit (%d) reached, stopping chunk discovery." % args.max_chunks, always=True)
-                break
-            REPORTER.detail("  CHUNK: %s" % chunk_url)
-            REPORTER.status("chunk %s" % os.path.basename(urllib.parse.urlsplit(chunk_url).path))
-            new_chunks = handle_js_file(session, chunk_url, referer, args, state, downloaded_urls)
-            for nc in new_chunks:
-                if nc not in seen_in_queue and nc not in downloaded_urls and nc not in state["dead_chunks"]:
-                    queue.add(nc)
-                    seen_in_queue.add(nc)
-
-
-# ---- Startup Probe ----
-
-def probe_start_url(session, args):
+def probe(args):
     try:
-        resp = session.get(args.url, timeout=(args.timeout, args.read_timeout), allow_redirects=True)
-        sent_cookies = list(session.cookies.get_dict().keys())
-        set_cookie_headers = resp.raw.headers.get_all("Set-Cookie") if hasattr(resp.raw, "headers") and hasattr(resp.raw.headers, "get_all") else []
-        if not set_cookie_headers:
-            set_cookie_headers = [v for k, v in resp.headers.items() if k.lower() == "set-cookie"]
-        REPORTER.detail("[probe] status=%d final_url=%s" % (resp.status_code, resp.url))
-        REPORTER.detail("[probe] sent cookies: %s" % sent_cookies)
-        REPORTER.detail("[probe] response Set-Cookie: %s" % set_cookie_headers)
-        if "login" in resp.url.lower() or "signin" in resp.url.lower():
-            REPORTER.log("[probe] WARNING: start URL redirected to a login page -- session may be unauthenticated.", always=True)
+        r = SESSION.get(args.url, timeout=(args.timeout, args.read_timeout), allow_redirects=True)
+        REPORTER.detail("[probe] status=%d final_url=%s" % (r.status_code, r.url))
+        REPORTER.detail("[probe] sent cookies: %s" % list(SESSION.cookies.get_dict().keys()))
+        if "login" in r.url.lower() or "signin" in r.url.lower():
+            REPORTER.log("[probe] WARNING: redirected to a login page -- auth may be inactive.", always=True)
     except requests.exceptions.RequestException as e:
         REPORTER.log("[probe] Failed to reach start URL: %s" % e, always=True)
 
 
-# ---- Main Entry Point ----
+# =============================================================================
+# Main
+# =============================================================================
 
 def print_summary(state):
     print("\nDone.")
@@ -977,7 +1174,7 @@ def print_summary(state):
 
 
 def main():
-    global _STRIP_QUERY
+    global _STRIP_QUERY, SESSION, MASTER_COOKIES
 
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -991,53 +1188,64 @@ def main():
                  state["jsendpoints_path"], state["jschunks_path"], state["routes_path"]):
         open(path, "a", encoding="utf-8").close()
 
-    session, cookies, auth_header_set = build_session(args, args.url)
+    SESSION, n_cookies, auth_set = build_session(args, args.url)
+    MASTER_COOKIES = list(SESSION.cookies)
 
-    if args.all_domains:
-        domain_scope = "unrestricted"
-    elif args.same_subdomain:
-        domain_scope = "same-subdomain"
-    else:
-        domain_scope = "same-domain"
+    domain_scope = "unrestricted" if args.all_domains else \
+                   ("same-subdomain" if args.same_subdomain else "same-domain")
 
-    print("Crawling Hound  |  %s  |  domain: %s  |  framework JS: %s  |  ssl: %s  |  strip-query: %s" % (
-        args.url,
+    print("Crawling Hound  |  %s" % args.url)
+    print("  domain: %s | framework JS: %s | ssl: %s | strip-query: %s" % (
         domain_scope,
         "skipped" if args.skip_framework else "included",
         "off" if args.insecure else "on",
         "on" if args.strip_query else "off",
     ))
-    print("Output: %s/   Cookies: %d %s   Auth header: %s   Max chunks: %s" % (
-        args.output, len(cookies), list(cookies.keys()) if cookies else "",
-        "yes" if auth_header_set else "no",
+    print("  output: %s/ | cookies: %d | auth header: %s | max chunks: %s" % (
+        args.output, n_cookies,
+        "yes" if auth_set else "no",
         str(args.max_chunks) if args.max_chunks else "unlimited",
     ))
-    if not HAVE_BS4:
-        print("Note: beautifulsoup4 not installed, falling back to regex HTML parsing.")
+    print("  concurrency: %d | preflight: %s | Accept-Encoding: %s" % (
+        args.concurrency, "on" if args.preflight else "off", _accept_encoding(args),
+    ))
+    print("  requests: %s | urllib3: %s | brotli: %s | zstd: %s" % (
+        requests.__version__, URLLIB3_VERSION,
+        (_BROTLI_MODE if HAVE_BROTLI else "missing"),
+        ("yes" if HAVE_ZSTD else "missing"),
+    ))
 
-    probe_start_url(session, args)
+    if not HAVE_BS4:
+        print("  NOTE: beautifulsoup4 not installed - using regex HTML parser")
+    if not HAVE_BROTLI and not args.no_compression and args.compression == "auto":
+        print("  NOTE: brotli not installed - br encoding will not be advertised")
+        print("        install with: pip install brotli zstandard")
+    if not HAVE_ZSTD and args.compression == "auto":
+        pass  # quiet, brotli note covers it
+    if URLLIB3_VERSION.startswith("1.") and HAVE_BROTLI and not args.no_compression:
+        print("  NOTE: urllib3 v1.x uses 'brotlipy', not 'brotli'. If downloads")
+        print("        land as binary, use --no-compression or upgrade urllib3.")
+
+    probe(args)
 
     base_domain = domain_of(args.url)
-    visited = set()
-    downloaded_urls = set()
 
     if args.resume:
-        loaded, downloaded_urls = load_resume_state(state)
-        visited = set(state["pages_crawled"])
-        print("Resumed: %d prior lines loaded, %d JS files already on disk." % (loaded, len(downloaded_urls)))
+        loaded = load_resume_state(state)
+        print("  resumed: %d prior entries loaded, %d JS files verified on disk" % (
+            loaded, len(state["downloaded_urls"])))
 
     try:
-        crawl_page(session, args.url, 0, args, state, base_domain, visited, downloaded_urls)
+        crawl(args, state, base_domain)
     except KeyboardInterrupt:
         REPORTER.clear_status()
-        print("\nInterrupted by user, saving current progress...")
+        print("\nInterrupted - saving progress...")
     finally:
         REPORTER.clear_status()
         flush_final(state)
         print_summary(state)
         if args.json:
-            json_path = write_json_results(state, args)
-            print("JSON results: %s" % json_path)
+            print("JSON results: %s" % write_json_results(state, args))
 
 
 if __name__ == "__main__":
